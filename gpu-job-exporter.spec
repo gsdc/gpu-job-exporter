@@ -3,7 +3,7 @@ Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Prometheus exporter for GPU job completions (nvidia-smi + CPU time)
 License:        MIT
-BuildArch:      noarch
+BuildArch:      x86_64
 
 # Source tarball is created by build_rpm.sh and includes vendored Python libs.
 Source0:        %{name}-%{version}.tar.gz
@@ -79,5 +79,5 @@ exit 0
 
 # ── Changelog ────────────────────────────────────────────────────────────────
 %changelog
-* Tue Apr 01 2026 Your Name <you@example.com> - 1.0.0-1
+* Wed Apr 01 2026 Geonmo Ryu <geonmo@kisti.re.kr> - 1.0.0-1
 - Initial release
