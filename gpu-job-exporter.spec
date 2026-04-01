@@ -10,7 +10,7 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  systemd-rpm-macros
 Requires:       python3 >= 3.9
-Requires:       nvidia-smi
+Requires:       nvidia-driver-cuda
 # psutil & prometheus_client are vendored inside the tarball under lib/,
 # so no extra RPM dependencies are needed at install time.
 

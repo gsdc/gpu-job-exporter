@@ -60,5 +60,5 @@ find ~/rpmbuild/RPMS ~/rpmbuild/SRPMS -name "${NAME}*.rpm" | sort | while read -
 done
 echo ""
 echo "Install with:"
-echo "  sudo rpm  -ivh ~/rpmbuild/RPMS/noarch/${NAME}-${VERSION}-1.*.noarch.rpm"
-echo "  sudo dnf install ~/rpmbuild/RPMS/noarch/${NAME}-${VERSION}-1.*.noarch.rpm"
+echo "  sudo rpm  -ivh ~/rpmbuild/RPMS/x86_64/${NAME}-${VERSION}-1.*.rpm"
+echo "  sudo dnf install ~/rpmbuild/RPMS/x86_64/${NAME}-${VERSION}-1.*.rpm"

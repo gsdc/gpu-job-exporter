@@ -4,6 +4,8 @@ GPU Job Completion Exporter (with CPU Time tracking)
 Monitors nvidia-smi and reports completed GPU process counts and CPU time via Prometheus.
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
 import time
