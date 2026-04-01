@@ -1,0 +1,26 @@
+[Unit]
+Description=GPU Job Completion Prometheus Exporter
+Documentation=https://github.com/your-org/gpu-job-exporter
+After=network.target
+
+[Service]
+Type=simple
+User=gpu-exporter
+Group=gpu-exporter
+Environment=GPU_EXPORTER_POLL_INTERVAL=2
+Environment=GPU_EXPORTER_PORT=9101
+ExecStart=/usr/bin/gpu-job-exporter
+Restart=on-failure
+RestartSec=5
+# /proc/<pid>/stat is world-readable, so no special caps needed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# stdout → journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gpu-job-exporter
+
+[Install]
+WantedBy=multi-user.target
