@@ -1,0 +1,72 @@
+name: Build RPM and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: almalinux:9
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y \
+            rpm-build rpmdevtools \
+            python3 python3-pip \
+            git tar
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up rpmbuild tree
+        run: rpmdev-setuptree
+
+      - name: Vendor Python dependencies
+        run: |
+          pip3 install \
+            --target=lib \
+            --quiet \
+            --no-compile \
+            "prometheus_client>=0.20.0" \
+            "psutil>=5.9.0"
+          find lib -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find lib -type d -name "tests"       -exec rm -rf {} + 2>/dev/null || true
+          find lib -name "*.pyc"               -delete 2>/dev/null           || true
+
+      - name: Create source tarball
+        run: |
+          VERSION=${{ steps.ver.outputs.VERSION }}
+          SRCDIR="gpu-job-exporter-${VERSION}"
+          mkdir -p "${SRCDIR}"
+          cp gpu_job_exporter.py gpu-job-exporter.service "${SRCDIR}/"
+          cp -r lib "${SRCDIR}/"
+          tar czf ~/rpmbuild/SOURCES/${SRCDIR}.tar.gz "${SRCDIR}"
+
+      - name: Patch spec version
+        run: |
+          VERSION=${{ steps.ver.outputs.VERSION }}
+          sed -i "s/^Version:.*/Version:        ${VERSION}/" gpu-job-exporter.spec
+          cp gpu-job-exporter.spec ~/rpmbuild/SPECS/
+
+      - name: Build RPM
+        run: rpmbuild -ba ~/rpmbuild/SPECS/gpu-job-exporter.spec
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          find ~/rpmbuild/RPMS ~/rpmbuild/SRPMS -name "*.rpm" -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.rpm
+          generate_release_notes: true
