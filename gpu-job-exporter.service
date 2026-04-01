@@ -9,6 +9,7 @@ User=gpu-exporter
 Group=gpu-exporter
 Environment=GPU_EXPORTER_POLL_INTERVAL=2
 Environment=GPU_EXPORTER_PORT=9101
+Environment=GPU_EXPORTER_STATE_FILE=/var/lib/gpu-job-exporter/state.json
 ExecStart=/usr/bin/gpu-job-exporter
 Restart=on-failure
 RestartSec=5
@@ -17,6 +18,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=/var/lib/gpu-job-exporter
 # stdout → journald
 StandardOutput=journal
 StandardError=journal

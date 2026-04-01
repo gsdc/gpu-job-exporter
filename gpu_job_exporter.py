@@ -6,8 +6,11 @@ Monitors nvidia-smi and reports completed GPU process counts and CPU time via Pr
 
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
+import sys
 import time
 import logging
 from dataclasses import dataclass
@@ -19,6 +22,9 @@ from prometheus_client import start_http_server, Counter, Summary
 # --- Configuration (overridable via environment variables) ---
 POLL_INTERVAL = float(os.environ.get("GPU_EXPORTER_POLL_INTERVAL", 2))
 EXPORTER_PORT = int(os.environ.get("GPU_EXPORTER_PORT", 9101))
+STATE_FILE = os.environ.get(
+    "GPU_EXPORTER_STATE_FILE", "/var/lib/gpu-job-exporter/state.json"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -39,6 +45,73 @@ gpu_job_duration = Summary(
     "CPU time distribution of individual completed GPU jobs",
     ["gpu_uuid", "process_name"],
 )
+
+# --- Persistence state ---
+# Maps "gpu_uuid|process_name" -> {completed, cpu_time, duration_sum, duration_count}
+_persist: dict[str, dict[str, float]] = {}
+
+
+def _pkey(gpu_uuid: str, process_name: str) -> str:
+    return f"{gpu_uuid}|{process_name}"
+
+
+def load_state() -> None:
+    """Load persisted metric values and replay them into Prometheus counters."""
+    try:
+        with open(STATE_FILE) as f:
+            saved: dict[str, dict[str, float]] = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logger.warning("Could not load state file %s: %s", STATE_FILE, exc)
+        return
+
+    for key, vals in saved.items():
+        try:
+            gpu_uuid, process_name = key.split("|", 1)
+        except ValueError:
+            continue
+        labels = {"gpu_uuid": gpu_uuid, "process_name": process_name}
+
+        completed     = vals.get("completed", 0)
+        cpu_time      = vals.get("cpu_time", 0.0)
+        duration_sum  = vals.get("duration_sum", 0.0)
+        duration_count = int(vals.get("duration_count", 0))
+
+        if completed > 0:
+            gpu_job_completed.labels(**labels).inc(completed)
+        if cpu_time > 0:
+            gpu_job_cpu_time_seconds.labels(**labels).inc(cpu_time)
+        if duration_count > 0:
+            child = gpu_job_duration.labels(**labels)
+            child._sum.inc(duration_sum)
+            child._count.inc(duration_count)
+
+        _persist[key] = {
+            "completed":      completed,
+            "cpu_time":       cpu_time,
+            "duration_sum":   duration_sum,
+            "duration_count": duration_count,
+        }
+
+    logger.info("Restored state from %s (%d label sets)", STATE_FILE, len(saved))
+
+
+def save_state() -> None:
+    """Atomically persist current accumulated metric values to disk."""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_persist, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        logger.warning("Could not save state to %s: %s", STATE_FILE, exc)
+
+
+def _handle_shutdown(signum, frame):
+    save_state()
+    sys.exit(0)
 
 
 # --- State per tracked PID ---
@@ -146,6 +219,9 @@ def process_finished(
     Detect PIDs that disappeared, record metrics, log, then remove from tracked.
     """
     finished_pids = set(tracked) - set(current_pids)
+    if not finished_pids:
+        return
+
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for pid in finished_pids:
@@ -163,6 +239,15 @@ def process_finished(
         gpu_job_cpu_time_seconds.labels(**labels).inc(cpu_used)
         gpu_job_duration.labels(**labels).observe(cpu_used)
 
+        key = _pkey(entry.gpu_uuid, entry.process_name)
+        s = _persist.setdefault(
+            key, {"completed": 0, "cpu_time": 0.0, "duration_sum": 0.0, "duration_count": 0}
+        )
+        s["completed"]      += 1
+        s["cpu_time"]       += cpu_used
+        s["duration_sum"]   += cpu_used
+        s["duration_count"] += 1
+
         logger.info(
             "[%s] [Finished] PID: %d (%s) | GPU: %s | Used CPU Time: %.2fs",
             ts,
@@ -172,8 +257,14 @@ def process_finished(
             cpu_used,
         )
 
+    save_state()
+
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
+    load_state()
     start_http_server(EXPORTER_PORT)
     logger.info(
         "GPU Job Exporter started — metrics at http://0.0.0.0:%d/metrics",

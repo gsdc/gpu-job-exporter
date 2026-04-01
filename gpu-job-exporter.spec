@@ -36,6 +36,9 @@ cp -r lib            %{buildroot}%{_libexecdir}/%{name}/lib
 install -m 0644 gpu_job_exporter.py \
                      %{buildroot}%{_libexecdir}/%{name}/gpu_job_exporter.py
 
+# State directory for metric persistence across restarts
+install -d -m 0750 %{buildroot}%{_sharedstatedir}/%{name}
+
 # Wrapper script (sets PYTHONPATH so vendored libs are found)
 install -d %{buildroot}%{_bindir}
 cat > %{buildroot}%{_bindir}/%{name} << 'WRAPPER'
@@ -75,6 +78,7 @@ exit 0
 %{_libexecdir}/%{name}/gpu_job_exporter.py
 %{_libexecdir}/%{name}/lib/
 %{_unitdir}/%{name}.service
+%attr(0750,gpu-exporter,gpu-exporter) %dir %{_sharedstatedir}/%{name}
 
 
 # ── Changelog ────────────────────────────────────────────────────────────────
