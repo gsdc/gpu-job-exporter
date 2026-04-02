@@ -15,7 +15,9 @@ GPU time tracking mode is determined per-GPU at startup:
 
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
 import time
 import logging
@@ -38,6 +40,13 @@ EXPORTER_PORT = int(os.environ.get("GPU_EXPORTER_PORT", 9101))
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+STATE_FILE = os.environ.get(
+    "GPU_EXPORTER_STATE_FILE",
+    "/var/lib/gpu_job_exporter/state.json",
+)
+# Save state every this many poll cycles (default: ~60 s at 2 s poll interval)
+_SAVE_EVERY = max(1, int(os.environ.get("GPU_EXPORTER_SAVE_INTERVAL_CYCLES", 30)))
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
@@ -93,6 +102,105 @@ gpu_job_gpu_duration = Summary(
 
 _nvml_handle_cache: dict[str, object] = {}   # gpu_uuid -> handle
 _accounting_enabled: dict[str, bool] = {}    # gpu_uuid -> True/False
+
+# ---------------------------------------------------------------------------
+# State persistence helpers
+# ---------------------------------------------------------------------------
+
+# Internal counter accumulators kept in sync with Prometheus Counters.
+# Structure: { "completed": {"uuid|name": float}, "cpu_time": {...}, "gpu_time": {...} }
+_totals: dict[str, dict[str, float]] = {
+    "completed": {},
+    "cpu_time": {},
+    "gpu_time": {},
+}
+
+
+def _label_key(gpu_uuid: str, process_name: str) -> str:
+    return f"{gpu_uuid}|{process_name}"
+
+
+def _save_state(tracked: dict[int, "ProcessEntry"]) -> None:
+    """Atomically write current counter totals and tracked-PID state to disk."""
+    state = {
+        "totals": _totals,
+        "tracked": {
+            str(pid): {
+                "gpu_uuid": e.gpu_uuid,
+                "process_name": e.process_name,
+                "baseline_cpu": e.baseline_cpu,
+                "last_cpu": e.last_cpu,
+                "accumulated_gpu_s": e.accumulated_gpu_s,
+                "last_util_ts": e.last_util_ts,
+            }
+            for pid, e in tracked.items()
+        },
+    }
+    state_dir = os.path.dirname(STATE_FILE) or "."
+    os.makedirs(state_dir, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+        logger.debug("State saved to %s.", STATE_FILE)
+    except OSError as exc:
+        logger.warning("Failed to save state: %s", exc)
+
+
+def _load_state() -> tuple[dict[str, dict[str, float]], dict[int, "ProcessEntry"]]:
+    """
+    Load persisted state from disk.
+    Returns (totals_dict, {pid: ProcessEntry}).
+    Both values are empty/zeroed when the file is absent or corrupt.
+    """
+    empty_totals: dict[str, dict[str, float]] = {
+        "completed": {},
+        "cpu_time": {},
+        "gpu_time": {},
+    }
+    if not os.path.exists(STATE_FILE):
+        return empty_totals, {}
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        totals = state.get("totals", empty_totals)
+        tracked: dict[int, ProcessEntry] = {}
+        for pid_str, e in state.get("tracked", {}).items():
+            tracked[int(pid_str)] = ProcessEntry(
+                gpu_uuid=e["gpu_uuid"],
+                process_name=e["process_name"],
+                baseline_cpu=e["baseline_cpu"],
+                last_cpu=e["last_cpu"],
+                accumulated_gpu_s=e["accumulated_gpu_s"],
+                last_util_ts=e["last_util_ts"],
+            )
+        logger.info(
+            "Loaded state from %s: %d label(s) in totals, %d tracked PID(s).",
+            STATE_FILE,
+            sum(len(v) for v in totals.values()),
+            len(tracked),
+        )
+        return totals, tracked
+    except Exception as exc:
+        logger.warning("Could not load state file (%s) — starting fresh.", exc)
+        return empty_totals, {}
+
+
+def _restore_counters(saved_totals: dict[str, dict[str, float]]) -> None:
+    """Replay saved counter totals into Prometheus by calling inc()."""
+    for key, val in saved_totals.get("completed", {}).items():
+        if val > 0:
+            gpu_uuid, process_name = key.split("|", 1)
+            gpu_job_completed.labels(gpu_uuid=gpu_uuid, process_name=process_name).inc(val)
+    for key, val in saved_totals.get("cpu_time", {}).items():
+        if val > 0:
+            gpu_uuid, process_name = key.split("|", 1)
+            gpu_job_cpu_time_seconds.labels(gpu_uuid=gpu_uuid, process_name=process_name).inc(val)
+    for key, val in saved_totals.get("gpu_time", {}).items():
+        if val > 0:
+            gpu_uuid, process_name = key.split("|", 1)
+            gpu_job_gpu_time_seconds.labels(gpu_uuid=gpu_uuid, process_name=process_name).inc(val)
 
 
 def _nvml_init() -> None:
@@ -410,6 +518,12 @@ def process_finished(
         gpu_job_cpu_duration.labels(**labels).observe(cpu_used)
         gpu_job_gpu_duration.labels(**labels).observe(gpu_used)
 
+        # Keep internal totals in sync for state persistence.
+        key = _label_key(entry.gpu_uuid, entry.process_name)
+        _totals["completed"][key] = _totals["completed"].get(key, 0) + 1
+        _totals["cpu_time"][key]   = _totals["cpu_time"].get(key, 0)  + cpu_used
+        _totals["gpu_time"][key]   = _totals["gpu_time"].get(key, 0)  + gpu_used
+
         # Clean up running-job gauges.
         gpu_job_running.labels(**labels).dec()
         gpu_job_running_cpu_time_seconds.remove(entry.gpu_uuid, entry.process_name, pid_str)
@@ -429,7 +543,21 @@ def process_finished(
 
 
 def main() -> None:
+    global _totals
+
     _nvml_init()
+
+    # ------------------------------------------------------------------
+    # Restore persisted state (counters + tracked PIDs)
+    # ------------------------------------------------------------------
+    saved_totals, saved_tracked = _load_state()
+
+    # Carry over accumulated totals so future increments stay cumulative.
+    _totals = saved_totals
+
+    # Replay saved counter values into Prometheus before exposing metrics.
+    _restore_counters(saved_totals)
+
     start_http_server(EXPORTER_PORT)
     logger.info(
         "GPU Job Exporter started — metrics at http://0.0.0.0:%d/metrics",
@@ -437,7 +565,51 @@ def main() -> None:
     )
 
     tracked: dict[int, ProcessEntry] = {}
-    first_cycle = True
+
+    if saved_tracked:
+        # Pre-populate tracked dict and running gauge so that the first poll
+        # cycle can correctly decrement them for PIDs that finished while the
+        # daemon was down.
+        for pid, entry in saved_tracked.items():
+            tracked[pid] = entry
+            gpu_job_running.labels(
+                gpu_uuid=entry.gpu_uuid, process_name=entry.process_name
+            ).inc()
+            # Restore live CPU/GPU time gauges immediately so Prometheus sees
+            # non-zero values even before the first poll completes.
+            cpu_elapsed = max(0.0, entry.last_cpu - entry.baseline_cpu)
+            pid_str = str(pid)
+            gpu_job_running_cpu_time_seconds.labels(
+                gpu_uuid=entry.gpu_uuid,
+                process_name=entry.process_name,
+                pid=pid_str,
+            ).set(cpu_elapsed)
+            gpu_job_running_gpu_time_seconds.labels(
+                gpu_uuid=entry.gpu_uuid,
+                process_name=entry.process_name,
+                pid=pid_str,
+            ).set(entry.accumulated_gpu_s)
+        logger.info("Restored %d tracked PID(s) from state file.", len(tracked))
+
+    # first_cycle=False when restored so that process_finished runs on the very
+    # first poll and can immediately record PIDs that ended while we were down.
+    first_cycle = len(tracked) == 0
+
+    # ------------------------------------------------------------------
+    # Signal handlers — save state on clean shutdown
+    # ------------------------------------------------------------------
+    def _on_exit(signum, frame):
+        logger.info("Signal %d received — saving state before exit.", signum)
+        _save_state(tracked)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _on_exit)
+    signal.signal(signal.SIGINT, _on_exit)
+
+    # ------------------------------------------------------------------
+    # Main poll loop
+    # ------------------------------------------------------------------
+    save_cycle = 0
 
     while True:
         current_pids = query_gpu_processes()
@@ -451,6 +623,13 @@ def main() -> None:
 
         update_tracked(tracked, current_pids)
         first_cycle = False
+
+        # Periodic state persistence
+        save_cycle += 1
+        if save_cycle >= _SAVE_EVERY:
+            _save_state(tracked)
+            save_cycle = 0
+
         time.sleep(POLL_INTERVAL)
 
 
