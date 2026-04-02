@@ -1,6 +1,6 @@
 # gpu-job-exporter
 
-NVIDIA GPU 서버에서 실행 중인 프로세스를 감시하여, 작업이 종료될 때마다 종료 건수와 CPU 사용 시간을 Prometheus 메트릭으로 노출하는 경량 Python Exporter입니다.
+NVIDIA GPU 서버에서 실행 중인 프로세스를 감시하여, 작업의 실행 상태·종료 건수·CPU 사용 시간·GPU 활성 시간을 Prometheus 메트릭으로 노출하는 경량 Python Exporter입니다.
 
 ---
 
@@ -48,7 +48,7 @@ bash build_rpm.sh
 
 빌드 스크립트가 자동으로 수행하는 작업:
 
-1. `prometheus_client`, `psutil` 을 `lib/` 디렉터리에 vendoring
+1. `prometheus_client`, `psutil`, `pynvml` 을 `lib/` 디렉터리에 vendoring
 2. 소스 타르볼 (`gpu-job-exporter-1.0.0.tar.gz`) 생성
 3. `~/rpmbuild/` 트리에 파일 배치
 4. `rpmbuild -ba` 실행
@@ -97,6 +97,7 @@ done
 - 의존 라이브러리: `/usr/libexec/gpu-job-exporter/lib/`
 - systemd 유닛: `/usr/lib/systemd/system/gpu-job-exporter.service`
 - 서비스 계정: `gpu-exporter` (시스템 유저, 자동 생성)
+- 상태 디렉터리: `/var/lib/gpu_job_exporter/` (자동 생성)
 
 ---
 
@@ -129,6 +130,8 @@ sudo journalctl -fu gpu-job-exporter
 |---|---|---|
 | `GPU_EXPORTER_POLL_INTERVAL` | `2` | nvidia-smi 폴링 간격 (초, 소수점 허용) |
 | `GPU_EXPORTER_PORT` | `9101` | Prometheus 메트릭 노출 포트 |
+| `GPU_EXPORTER_STATE_FILE` | `/var/lib/gpu_job_exporter/state.json` | 상태 영속성 파일 경로 |
+| `GPU_EXPORTER_SAVE_INTERVAL_CYCLES` | `30` | 상태 저장 주기 (폴 사이클 수, 기본 ~60초) |
 
 ### 값 변경 방법 (권장 — 패키지 업그레이드 후에도 유지됨)
 
@@ -142,6 +145,7 @@ sudo systemctl edit gpu-job-exporter
 [Service]
 Environment=GPU_EXPORTER_POLL_INTERVAL=5
 Environment=GPU_EXPORTER_PORT=9200
+Environment=GPU_EXPORTER_SAVE_INTERVAL_CYCLES=60
 ```
 
 ```bash
@@ -154,6 +158,36 @@ sudo systemctl restart gpu-job-exporter
 
 ---
 
+## GPU 시간 추적 모드
+
+서비스 시작 시 GPU별로 자동 결정됩니다. 로그에서 확인 가능합니다:
+
+```
+GPU GPU-xxxx — accounting mode: ENABLED (activated now).
+GPU GPU-yyyy — accounting mode: UNAVAILABLE — falling back to polling.
+```
+
+| 모드 | 정확도 | 권한 |
+|---|---|---|
+| Accounting | 드라이버가 정확한 GPU 활성 시간 기록 | root 필요 (자동 시도) |
+| Polling | SM 사용률 샘플 적분 (근사치) | 일반 권한으로 동작 |
+
+`pynvml` 미설치 시 GPU time은 `0.0` 으로 보고되며 나머지 기능은 정상 동작합니다.
+
+---
+
+## 상태 영속성
+
+서비스 재시작 시 카운터가 리셋되지 않도록 상태를 주기적으로 파일에 저장합니다.
+
+- **저장 시점:** 매 `_SAVE_EVERY` 사이클마다, SIGTERM/SIGINT 수신 시
+- **저장 내용:** 완료된 작업 카운터 누적값, 현재 추적 중인 PID 상태
+- **재시작 시:** 저장된 카운터를 Prometheus에 재현하여 연속성 보장
+
+다운타임 중 종료된 프로세스는 재시작 첫 번째 폴 사이클에서 감지하여 기록합니다.
+
+---
+
 ## 메트릭 확인
 
 ```bash
@@ -163,6 +197,18 @@ curl -s http://localhost:9101/metrics | grep gpu_job
 출력 예시:
 
 ```
+# HELP gpu_job_running Number of GPU jobs currently running
+# TYPE gpu_job_running gauge
+gpu_job_running{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 2.0
+
+# HELP gpu_job_running_cpu_time_seconds CPU time consumed so far by each running GPU job
+# TYPE gpu_job_running_cpu_time_seconds gauge
+gpu_job_running_cpu_time_seconds{gpu_uuid="GPU-a1b2c3d4",pid="18432",process_name="python3"} 45.3
+
+# HELP gpu_job_running_gpu_time_seconds GPU active time consumed so far by each running GPU job
+# TYPE gpu_job_running_gpu_time_seconds gauge
+gpu_job_running_gpu_time_seconds{gpu_uuid="GPU-a1b2c3d4",pid="18432",process_name="python3"} 30.1
+
 # HELP gpu_job_completed_total Total number of completed GPU compute jobs
 # TYPE gpu_job_completed_total counter
 gpu_job_completed_total{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 5.0
@@ -171,10 +217,19 @@ gpu_job_completed_total{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 5.0
 # TYPE gpu_job_cpu_time_seconds_total counter
 gpu_job_cpu_time_seconds_total{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 612.4
 
-# HELP gpu_job_duration_seconds CPU time distribution of individual completed GPU jobs
-# TYPE gpu_job_duration_seconds summary
-gpu_job_duration_seconds_count{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 5.0
-gpu_job_duration_seconds_sum{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 612.4
+# HELP gpu_job_gpu_time_seconds_total Total GPU active time consumed by completed GPU jobs
+# TYPE gpu_job_gpu_time_seconds_total counter
+gpu_job_gpu_time_seconds_total{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 430.2
+
+# HELP gpu_job_cpu_duration_seconds CPU time distribution of individual completed GPU jobs
+# TYPE gpu_job_cpu_duration_seconds summary
+gpu_job_cpu_duration_seconds_count{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 5.0
+gpu_job_cpu_duration_seconds_sum{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 612.4
+
+# HELP gpu_job_gpu_duration_seconds GPU active time distribution of individual completed GPU jobs
+# TYPE gpu_job_gpu_duration_seconds summary
+gpu_job_gpu_duration_seconds_count{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 5.0
+gpu_job_gpu_duration_seconds_sum{gpu_uuid="GPU-a1b2c3d4",process_name="python3"} 430.2
 ```
 
 ---
@@ -188,4 +243,3 @@ sudo dnf remove gpu-job-exporter
 sudo rm -rf /etc/systemd/system/gpu-job-exporter.service.d/
 sudo systemctl daemon-reload
 ```
-# gpu-job-exporter
