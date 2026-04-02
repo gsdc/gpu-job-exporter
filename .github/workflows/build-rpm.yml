@@ -1,0 +1,89 @@
+name: Build RPM
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: almalinux:9
+
+    steps:
+      - name: Install git
+        run: dnf install -y git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Tag: ${TAG}, Version: ${VERSION}"
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            rpm-build \
+            python3 \
+            python3-pip \
+            systemd-rpm-macros
+
+      - name: Update version in spec and build script
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # spec 파일 버전 업데이트
+          sed -i "s/^Version:.*/Version:        ${VERSION}/" gpu-job-exporter.spec
+
+          # changelog 날짜/버전 항목 추가
+          DATE=$(date +"%a %b %d %Y")
+          sed -i "/^%changelog/a * ${DATE} GitHub Actions <actions@github.com> - ${VERSION}-1\n- Release ${VERSION}" \
+              gpu-job-exporter.spec
+
+          # build_rpm.sh 버전 업데이트
+          sed -i "s/^VERSION=.*/VERSION=\"${VERSION}\"/" build_rpm.sh
+
+          echo "--- spec version check ---"
+          grep "^Version:" gpu-job-exporter.spec
+          grep "^VERSION=" build_rpm.sh
+
+      - name: Build RPM
+        run: bash build_rpm.sh
+
+      - name: Collect RPM files
+        id: rpms
+        run: |
+          RPM_PATH=$(find ~/rpmbuild/RPMS -name "*.rpm" | head -1)
+          SRPM_PATH=$(find ~/rpmbuild/SRPMS -name "*.rpm" | head -1)
+          echo "rpm=${RPM_PATH}" >> "$GITHUB_OUTPUT"
+          echo "srpm=${SRPM_PATH}" >> "$GITHUB_OUTPUT"
+          echo "--- Built RPMs ---"
+          find ~/rpmbuild/RPMS ~/rpmbuild/SRPMS -name "*.rpm" | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "gpu-job-exporter ${{ steps.version.outputs.tag }}"
+          body: |
+            ## gpu-job-exporter ${{ steps.version.outputs.tag }}
+
+            AlmaLinux 9 환경에서 자동 빌드된 RPM 패키지입니다.
+
+            ### 설치 방법
+            ```bash
+            sudo rpm -ivh gpu-job-exporter-${{ steps.version.outputs.version }}-1.el9.x86_64.rpm
+            # 또는
+            sudo dnf install gpu-job-exporter-${{ steps.version.outputs.version }}-1.el9.x86_64.rpm
+            ```
+          files: |
+            ~/rpmbuild/RPMS/**/*.rpm
+            ~/rpmbuild/SRPMS/**/*.rpm
+          fail_on_unmatched_files: false
