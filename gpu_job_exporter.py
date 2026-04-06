@@ -531,6 +531,10 @@ def process_finished(
         else:
             gpu_delta, _ = _sample_gpu_active_seconds(handle, pid, entry.last_util_ts)
             gpu_used = entry.accumulated_gpu_s + gpu_delta
+            if gpu_used == 0.0:
+                # No utilisation samples captured (job too short) — assume 100% GPU usage.
+                now_us = int(time.time() * 1e6)
+                gpu_used = (now_us - entry.last_util_ts) / 1e6
             gpu_mode_tag = "polling"
 
         # Record completed-job metrics.
