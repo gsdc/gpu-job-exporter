@@ -5,8 +5,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=gpu-exporter
-Group=gpu-exporter
+User=root
+Group=root
 Environment=GPU_EXPORTER_POLL_INTERVAL=2
 Environment=GPU_EXPORTER_PORT=9101
 ExecStart=/usr/bin/gpu-job-exporter
@@ -21,6 +21,7 @@ PrivateTmp=true
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=gpu-job-exporter
+ReadWritePaths=/var/lib/gpu_job_exporter
 
 [Install]
 WantedBy=multi-user.target
