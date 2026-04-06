@@ -8,8 +8,23 @@ BuildArch:      x86_64
 # Source tarball is created by build_rpm.sh and includes vendored Python libs.
 Source0:        %{name}-%{version}.tar.gz
 
+# EL7: systemd macros are part of the 'systemd' package itself.
+# EL8+: split into 'systemd-rpm-macros'.
+%if 0%{?rhel} >= 8 || 0%{?fedora}
 BuildRequires:  systemd-rpm-macros
+%else
+BuildRequires:  systemd
+%endif
+
+# EL7: python3 is 3.6; use python39 from EPEL for 3.9 support.
+# EL8+: python3 >= 3.9 is available in the default repos.
+%if 0%{?rhel} == 7
+%global python3_bin  /usr/bin/python3.9
+Requires:       python39 >= 3.9
+%else
+%global python3_bin  /usr/bin/python3
 Requires:       python3 >= 3.9
+%endif
 Requires:       nvidia-driver-cuda
 Requires:       libnvidia-ml.so.1
 # psutil, prometheus_client & pynvml are vendored inside the tarball under lib/,
@@ -42,7 +57,7 @@ install -d %{buildroot}%{_bindir}
 cat > %{buildroot}%{_bindir}/%{name} << 'WRAPPER'
 #!/bin/bash
 export PYTHONPATH=%{_libexecdir}/%{name}/lib${PYTHONPATH:+:${PYTHONPATH}}
-exec /usr/bin/python3 %{_libexecdir}/%{name}/gpu_job_exporter.py "$@"
+exec %{python3_bin} %{_libexecdir}/%{name}/gpu_job_exporter.py "$@"
 WRAPPER
 chmod 0755 %{buildroot}%{_bindir}/%{name}
 
