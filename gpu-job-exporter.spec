@@ -1,3 +1,7 @@
+# brp-python-bytecompile defaults to /usr/bin/python (Python 2) on EL7.
+# Override it so vendored Python 3 code compiles correctly.
+%global __python /usr/bin/python3
+
 Name:           gpu-job-exporter
 Version:        1.0.0
 Release:        1%{?dist}
