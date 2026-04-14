@@ -46,12 +46,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git init "${GITHUB_WORKSPACE}"
-          git -C "${GITHUB_WORKSPACE}" config --global --add safe.directory "${GITHUB_WORKSPACE}"
-          git -C "${GITHUB_WORKSPACE}" remote add origin \
+          cd "${GITHUB_WORKSPACE}"
+          git init .
+          git remote add origin \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          git -C "${GITHUB_WORKSPACE}" fetch --depth=1 origin "${{ github.ref }}"
-          git -C "${GITHUB_WORKSPACE}" checkout FETCH_HEAD
+          git fetch --depth=1 origin "${{ github.ref }}"
+          git checkout FETCH_HEAD
       - name: Checkout (EL9)
         if: matrix.el == '9'
         uses: actions/checkout@v4
