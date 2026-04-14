@@ -68,7 +68,7 @@ jobs:
       - name: Install build dependencies (EL7)
         if: matrix.el == '7'
         run: |
-          yum install -y rpm-build python3 python3-pip systemd
+          yum install -y rpm-build python3 python3-pip python3-devel gcc systemd
 
       - name: Install build dependencies (EL9)
         if: matrix.el == '9'
