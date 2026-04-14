@@ -8,11 +8,37 @@ on:
 jobs:
   build-rpm:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el: "7"
+            image: "centos:7"
+          - el: "9"
+            image: "almalinux:9"
     container:
-      image: almalinux:9
+      image: ${{ matrix.image }}
 
     steps:
-      - name: Install git
+      # CentOS 7은 2024-06 EOL → 미러가 비활성화되어 vault로 교체 필요
+      - name: Fix CentOS 7 EOL repos
+        if: matrix.el == '7'
+        run: |
+          sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo
+          sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \
+              /etc/yum.repos.d/CentOS-*.repo
+          yum install -y epel-release
+          # EPEL 7도 아카이브로 교체
+          sed -i 's|^mirrorlist=|#mirrorlist=|g'  /etc/yum.repos.d/epel*.repo
+          sed -i 's|^#baseurl=http://download.fedoraproject.org/pub/epel|baseurl=https://archives.fedoraproject.org/pub/archive/epel|g' \
+              /etc/yum.repos.d/epel*.repo
+
+      - name: Install git (EL7)
+        if: matrix.el == '7'
+        run: yum install -y git
+
+      - name: Install git (EL9)
+        if: matrix.el == '9'
         run: dnf install -y git
 
       - name: Checkout
@@ -23,49 +49,85 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"     >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Tag: ${TAG}, Version: ${VERSION}"
 
-      - name: Install build dependencies
+      - name: Install build dependencies (EL7)
+        if: matrix.el == '7'
         run: |
-          dnf install -y \
-            rpm-build \
-            python3 \
-            python3-pip \
-            systemd-rpm-macros
+          yum install -y rpm-build python3 python3-pip systemd
+
+      - name: Install build dependencies (EL9)
+        if: matrix.el == '9'
+        run: |
+          dnf install -y rpm-build python3 python3-pip systemd-rpm-macros
+
+      # EL7의 Python 3.6에서 작동하는 버전으로 의존성 제한
+      #   prometheus_client >= 0.20.0 → Python 3.8+ 필요
+      #   psutil >= 5.9.6            → Python 3.6 지원 종료
+      - name: Pin Python 3.6-compatible dependencies (EL7)
+        if: matrix.el == '7'
+        run: |
+          cat > requirements.txt << 'EOF'
+          prometheus_client>=0.7.0,<0.20.0
+          psutil>=5.9.0,<5.9.6
+          pynvml>=11.4.1
+          EOF
 
       - name: Update version in spec and build script
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # spec 파일 버전 업데이트
           sed -i "s/^Version:.*/Version:        ${VERSION}/" gpu-job-exporter.spec
 
-          # changelog 날짜/버전 항목 추가
           DATE=$(date +"%a %b %d %Y")
           sed -i "/^%changelog/a * ${DATE} GitHub Actions <actions@github.com> - ${VERSION}-1\n- Release ${VERSION}" \
               gpu-job-exporter.spec
 
-          # build_rpm.sh 버전 업데이트
           sed -i "s/^VERSION=.*/VERSION=\"${VERSION}\"/" build_rpm.sh
 
-          echo "--- spec version check ---"
+          echo "--- spec/build_rpm.sh version check ---"
           grep "^Version:" gpu-job-exporter.spec
           grep "^VERSION=" build_rpm.sh
 
       - name: Build RPM
         run: bash build_rpm.sh
 
-      - name: Collect RPM files
-        id: rpms
+      - name: List built RPMs
+        run: find /root/rpmbuild/RPMS /root/rpmbuild/SRPMS -name "*.rpm" | sort
+
+      - name: Upload RPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms-el${{ matrix.el }}
+          path: /root/rpmbuild/RPMS/**/*.rpm
+
+      - name: Upload SRPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: srpms-el${{ matrix.el }}
+          path: /root/rpmbuild/SRPMS/**/*.rpm
+
+  release:
+    needs: build-rpm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from tag
+        id: version
         run: |
-          RPM_PATH=$(find ~/rpmbuild/RPMS -name "*.rpm" | head -1)
-          SRPM_PATH=$(find ~/rpmbuild/SRPMS -name "*.rpm" | head -1)
-          echo "rpm=${RPM_PATH}" >> "$GITHUB_OUTPUT"
-          echo "srpm=${SRPM_PATH}" >> "$GITHUB_OUTPUT"
-          echo "--- Built RPMs ---"
-          find ~/rpmbuild/RPMS ~/rpmbuild/SRPMS -name "*.rpm" | sort
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all RPM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List downloaded artifacts
+        run: find artifacts/ -name "*.rpm" | sort
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -75,15 +137,18 @@ jobs:
           body: |
             ## gpu-job-exporter ${{ steps.version.outputs.tag }}
 
-            AlmaLinux 9 환경에서 자동 빌드된 RPM 패키지입니다.
+            EL7 (CentOS 7) 및 EL9 (AlmaLinux 9 / Rocky Linux 9) 환경에서 자동 빌드된 RPM 패키지입니다.
 
-            ### 설치 방법
+            ### 설치 방법 (EL9 / AlmaLinux 9 / Rocky Linux 9)
             ```bash
-            sudo rpm -ivh gpu-job-exporter-${{ steps.version.outputs.version }}-1.el9.x86_64.rpm
-            # 또는
             sudo dnf install gpu-job-exporter-${{ steps.version.outputs.version }}-1.el9.x86_64.rpm
             ```
-          files: |
-            ~/rpmbuild/RPMS/**/*.rpm
-            ~/rpmbuild/SRPMS/**/*.rpm
+
+            ### 설치 방법 (EL7 / CentOS 7)
+            ```bash
+            # EPEL의 python3 패키지가 필요합니다
+            sudo yum install epel-release
+            sudo yum install gpu-job-exporter-${{ steps.version.outputs.version }}-1.el7.x86_64.rpm
+            ```
+          files: artifacts/**/*.rpm
           fail_on_unmatched_files: false
