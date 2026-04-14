@@ -16,11 +16,11 @@ BuildRequires:  systemd-rpm-macros
 BuildRequires:  systemd
 %endif
 
-# EL7: python3 is 3.6; use python39 from EPEL for 3.9 support.
-# EL8+: python3 >= 3.9 is available in the default repos.
+# EL7: python3 is 3.6.8 (from base/updates or EPEL).
+# EL8+: python3 >= 3.9 is available in default repos.
 %if 0%{?rhel} == 7
-%global python3_bin  /usr/bin/python3.9
-Requires:       python39 >= 3.9
+%global python3_bin  /usr/bin/python3
+Requires:       python3 >= 3.6
 %else
 %global python3_bin  /usr/bin/python3
 Requires:       python3 >= 3.9
@@ -65,6 +65,10 @@ chmod 0755 %{buildroot}%{_bindir}/%{name}
 install -D -m 0644 %{name}.service \
     %{buildroot}%{_unitdir}/%{name}.service
 
+# Data and Log directories
+install -d %{buildroot}%{_sharedstatedir}/%{name}
+install -d %{buildroot}%{_localstatedir}/log/%{name}
+
 
 # ── Scriptlets ───────────────────────────────────────────────────────────────
 %pre
@@ -91,6 +95,8 @@ exit 0
 %{_libexecdir}/%{name}/gpu_job_exporter.py
 %{_libexecdir}/%{name}/lib/
 %{_unitdir}/%{name}.service
+%dir %attr(0755, gpu-exporter, gpu-exporter) %{_sharedstatedir}/%{name}
+%dir %attr(0755, gpu-exporter, gpu-exporter) %{_localstatedir}/log/%{name}
 
 
 # ── Changelog ────────────────────────────────────────────────────────────────

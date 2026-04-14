@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """
-GPU Job Completion Exporter (with CPU Time and GPU Time tracking)
-Monitors GPU processes and reports job counts, CPU time, and GPU active time
-via Prometheus — both for currently running jobs and for completed jobs.
-
-GPU time tracking mode is determined per-GPU at startup:
-  - Accounting mode  : driver records exact GPU active time per process.
-                       Queried once at process exit via nvmlDeviceGetAccountingStats.
-                       Also readable for live processes (isRunning=1).
-                       Requires root to enable; automatically attempted at startup.
-  - Polling mode     : SM utilisation samples are integrated over each poll interval.
-                       Used as fallback when accounting mode is unavailable.
+GPU Job Completion Exporter (with JSON Logging & Historical Calculation)
+Python 3.6.8 compatible.
 """
-
-from __future__ import annotations
 
 import json
 import os
@@ -21,8 +10,9 @@ import signal
 import subprocess
 import time
 import logging
-from dataclasses import dataclass
+import glob
 from datetime import datetime
+from typing import Dict, Tuple, Optional, Any
 
 import psutil
 from prometheus_client import start_http_server, Counter, Gauge, Summary
@@ -31,636 +21,330 @@ try:
     import pynvml
     _NVML_AVAILABLE = True
 except ImportError:
-    pynvml = None  # type: ignore[assignment]
+    pynvml = None
     _NVML_AVAILABLE = False
 
-# --- Configuration (overridable via environment variables) ---
-POLL_INTERVAL = float(os.environ.get("GPU_EXPORTER_POLL_INTERVAL", 2))
-EXPORTER_PORT = int(os.environ.get("GPU_EXPORTER_PORT", 9101))
+# --- Configuration ---
+POLL_INTERVAL: float = float(os.environ.get("GPU_EXPORTER_POLL_INTERVAL", 2))
+EXPORTER_PORT: int = int(os.environ.get("GPU_EXPORTER_PORT", 9101))
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-STATE_FILE = os.environ.get(
+STATE_FILE: str = os.environ.get(
     "GPU_EXPORTER_STATE_FILE",
     "/var/lib/gpu_job_exporter/state.json",
 )
-# Save state every this many poll cycles (default: ~60 s at 2 s poll interval)
-_SAVE_EVERY = max(1, int(os.environ.get("GPU_EXPORTER_SAVE_INTERVAL_CYCLES", 30)))
+LOG_DIR: str = os.environ.get(
+    "GPU_EXPORTER_LOG_DIR",
+    "/var/log/gpu_job_exporter",
+)
+_SAVE_EVERY: int = max(1, int(os.environ.get("GPU_EXPORTER_SAVE_INTERVAL_CYCLES", 30)))
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
 
-# -- Running jobs --
-gpu_job_running = Gauge(
-    "gpu_job_running",
-    "Number of GPU jobs currently running",
-    ["gpu_uuid", "process_name", "username"],
-)
-gpu_job_running_cpu_time_seconds = Gauge(
-    "gpu_job_running_cpu_time_seconds",
-    "CPU time (user+system) consumed so far by each running GPU job, in seconds",
-    ["gpu_uuid", "process_name", "username", "pid"],
-)
-gpu_job_running_gpu_time_seconds = Gauge(
-    "gpu_job_running_gpu_time_seconds",
-    "GPU active time consumed so far by each running GPU job, in seconds",
-    ["gpu_uuid", "process_name", "username", "pid"],
-)
+gpu_job_running = Gauge("gpu_job_running", "Number of GPU jobs currently running", ["gpu_uuid", "process_name", "username"])
+gpu_job_running_cpu_time_seconds = Gauge("gpu_job_running_cpu_time_seconds", "CPU time consumed so far", ["gpu_uuid", "process_name", "username", "pid"])
+gpu_job_running_gpu_time_seconds = Gauge("gpu_job_running_gpu_time_seconds", "GPU time consumed so far", ["gpu_uuid", "process_name", "username", "pid"])
 
-# -- Completed jobs --
-gpu_job_completed = Counter(
-    "gpu_job_completed_total",
-    "Total number of completed GPU compute jobs",
-    ["gpu_uuid", "process_name", "username"],
-)
-gpu_job_cpu_time_seconds = Counter(
-    "gpu_job_cpu_time_seconds_total",
-    "Total CPU time (user+system) consumed by completed GPU jobs, in seconds",
-    ["gpu_uuid", "process_name", "username"],
-)
-gpu_job_gpu_time_seconds = Counter(
-    "gpu_job_gpu_time_seconds_total",
-    "Total GPU active time consumed by completed GPU jobs, in seconds",
-    ["gpu_uuid", "process_name", "username"],
-)
-gpu_job_cpu_duration = Summary(
-    "gpu_job_cpu_duration_seconds",
-    "CPU time distribution of individual completed GPU jobs",
-    ["gpu_uuid", "process_name", "username"],
-)
-gpu_job_gpu_duration = Summary(
-    "gpu_job_gpu_duration_seconds",
-    "GPU active time distribution of individual completed GPU jobs",
-    ["gpu_uuid", "process_name", "username"],
-)
+gpu_job_completed = Counter("gpu_job_completed_total", "Total completed GPU jobs", ["gpu_uuid", "process_name", "username"])
+gpu_job_cpu_time_seconds = Counter("gpu_job_cpu_time_seconds_total", "Total CPU time consumed", ["gpu_uuid", "process_name", "username"])
+gpu_job_gpu_time_seconds = Counter("gpu_job_gpu_time_seconds_total", "Total GPU time consumed", ["gpu_uuid", "process_name", "username"])
+gpu_job_cpu_duration = Summary("gpu_job_cpu_duration_seconds", "CPU time distribution", ["gpu_uuid", "process_name", "username"])
+gpu_job_gpu_duration = Summary("gpu_job_gpu_duration_seconds", "GPU active time distribution", ["gpu_uuid", "process_name", "username"])
 
 # ---------------------------------------------------------------------------
-# NVML state
+# State & Logging Logic
 # ---------------------------------------------------------------------------
 
-_nvml_handle_cache: dict[str, object] = {}   # gpu_uuid -> handle
-_accounting_enabled: dict[str, bool] = {}    # gpu_uuid -> True/False
+_nvml_handle_cache: Dict[str, Any] = {}
+_accounting_enabled: Dict[str, bool] = {}
+_totals: Dict[str, Dict[str, float]] = {"completed": {}, "cpu_time": {}, "gpu_time": {}}
 
-# ---------------------------------------------------------------------------
-# State persistence helpers
-# ---------------------------------------------------------------------------
-
-# Internal counter accumulators kept in sync with Prometheus Counters.
-# Structure: { "completed": {"uuid|name": float}, "cpu_time": {...}, "gpu_time": {...} }
-_totals: dict[str, dict[str, float]] = {
-    "completed": {},
-    "cpu_time": {},
-    "gpu_time": {},
-}
-
+class ProcessEntry:
+    def __init__(self, gpu_uuid: str, process_name: str, username: str, 
+                 baseline_cpu: float, last_cpu: float, 
+                 accumulated_gpu_s: float = 0.0, last_util_ts: int = 0):
+        self.gpu_uuid = gpu_uuid
+        self.process_name = process_name
+        self.username = username
+        self.baseline_cpu = baseline_cpu
+        self.last_cpu = last_cpu
+        self.accumulated_gpu_s = accumulated_gpu_s
+        self.last_util_ts = last_util_ts
 
 def _label_key(gpu_uuid: str, process_name: str, username: str) -> str:
     return f"{gpu_uuid}|{process_name}|{username}"
 
+def _log_finished_job(entry: ProcessEntry, cpu_used: float, gpu_used: float, mode: str) -> None:
+    """작업 종료 시 JSON 로그 파일에 기록 (JSON Lines 포맷)"""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = os.path.join(LOG_DIR, f"jobs-{today}.json")
+    
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "gpu_uuid": entry.gpu_uuid,
+        "process_name": entry.process_name,
+        "username": entry.username,
+        "cpu_time_s": round(cpu_used, 3),
+        "gpu_time_s": round(gpu_used, 3),
+        "mode": mode
+    }
+    
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning(f"Failed to write job log: {exc}")
 
-def _save_state(tracked: dict[int, "ProcessEntry"]) -> None:
-    """Atomically write current counter totals and tracked-PID state to disk."""
+def _recalculate_totals_from_logs() -> Dict[str, Dict[str, float]]:
+    """로그 파일을 전체 스캔하여 누적 통계 계산"""
+    new_totals = {"completed": {}, "cpu_time": {}, "gpu_time": {}}
+    if not os.path.isdir(LOG_DIR):
+        return new_totals
+    
+    log_files = sorted(glob.glob(os.path.join(LOG_DIR, "jobs-*.json")))
+    if not log_files:
+        return new_totals
+
+    logger.info(f"Recalculating totals from {len(log_files)} log files...")
+    for path in log_files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip(): continue
+                    data = json.loads(line)
+                    key = _label_key(data["gpu_uuid"], data["process_name"], data["username"])
+                    
+                    new_totals["completed"][key] = new_totals["completed"].get(key, 0) + 1
+                    new_totals["cpu_time"][key] = new_totals["cpu_time"].get(key, 0) + data.get("cpu_time_s", 0)
+                    new_totals["gpu_time"][key] = new_totals["gpu_time"].get(key, 0) + data.get("gpu_time_s", 0)
+        except Exception as exc:
+            logger.warning(f"Error reading log file {path}: {exc}")
+            
+    return new_totals
+
+def _save_state(tracked: Dict[int, ProcessEntry]) -> None:
+    """현재 실행 중인 작업(tracked) 상태만 저장"""
     state = {
-        "totals": _totals,
         "tracked": {
             str(pid): {
-                "gpu_uuid": e.gpu_uuid,
-                "process_name": e.process_name,
-                "username": e.username,
-                "baseline_cpu": e.baseline_cpu,
-                "last_cpu": e.last_cpu,
-                "accumulated_gpu_s": e.accumulated_gpu_s,
-                "last_util_ts": e.last_util_ts,
-            }
-            for pid, e in tracked.items()
+                "gpu_uuid": e.gpu_uuid, "process_name": e.process_name, "username": e.username,
+                "baseline_cpu": e.baseline_cpu, "last_cpu": e.last_cpu,
+                "accumulated_gpu_s": e.accumulated_gpu_s, "last_util_ts": e.last_util_ts,
+            } for pid, e in tracked.items()
         },
     }
-    state_dir = os.path.dirname(STATE_FILE) or "."
-    os.makedirs(state_dir, exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
+    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+    tmp = f"{STATE_FILE}.tmp"
     try:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
-        logger.debug("State saved to %s.", STATE_FILE)
     except OSError as exc:
-        logger.warning("Failed to save state: %s", exc)
+        logger.warning(f"Failed to save state: {exc}")
 
-
-def _load_state() -> tuple[dict[str, dict[str, float]], dict[int, "ProcessEntry"]]:
-    """
-    Load persisted state from disk.
-    Returns (totals_dict, {pid: ProcessEntry}).
-    Both values are empty/zeroed when the file is absent or corrupt.
-    """
-    empty_totals: dict[str, dict[str, float]] = {
-        "completed": {},
-        "cpu_time": {},
-        "gpu_time": {},
-    }
+def _load_tracked_state() -> Dict[int, ProcessEntry]:
+    """이전 기동에서 실행 중이었던 작업 정보 복구"""
     if not os.path.exists(STATE_FILE):
-        return empty_totals, {}
+        return {}
     try:
         with open(STATE_FILE) as f:
             state = json.load(f)
-        totals = state.get("totals", empty_totals)
-        tracked: dict[int, ProcessEntry] = {}
+        tracked = {}
         for pid_str, e in state.get("tracked", {}).items():
             tracked[int(pid_str)] = ProcessEntry(
-                gpu_uuid=e["gpu_uuid"],
-                process_name=e["process_name"],
-                username=e.get("username", "unknown"),
-                baseline_cpu=e["baseline_cpu"],
-                last_cpu=e["last_cpu"],
-                accumulated_gpu_s=e["accumulated_gpu_s"],
-                last_util_ts=e["last_util_ts"],
+                gpu_uuid=e["gpu_uuid"], process_name=e["process_name"], username=e.get("username", "unknown"),
+                baseline_cpu=e["baseline_cpu"], last_cpu=e["last_cpu"],
+                accumulated_gpu_s=e["accumulated_gpu_s"], last_util_ts=e["last_util_ts"],
             )
-        logger.info(
-            "Loaded state from %s: %d label(s) in totals, %d tracked PID(s).",
-            STATE_FILE,
-            sum(len(v) for v in totals.values()),
-            len(tracked),
-        )
-        return totals, tracked
-    except Exception as exc:
-        logger.warning("Could not load state file (%s) — starting fresh.", exc)
-        return empty_totals, {}
+        return tracked
+    except Exception:
+        return {}
 
+def _restore_prometheus_counters() -> None:
+    """_totals 데이터를 Prometheus Counter에 주입"""
+    for key, val in _totals["completed"].items():
+        if val > 0:
+            gpu_uuid, proc, user = _parse_label_key(key)
+            gpu_job_completed.labels(gpu_uuid=gpu_uuid, process_name=proc, username=user).inc(val)
+    for key, val in _totals["cpu_time"].items():
+        if val > 0:
+            gpu_uuid, proc, user = _parse_label_key(key)
+            gpu_job_cpu_time_seconds.labels(gpu_uuid=gpu_uuid, process_name=proc, username=user).inc(val)
+    for key, val in _totals["gpu_time"].items():
+        if val > 0:
+            gpu_uuid, proc, user = _parse_label_key(key)
+            gpu_job_gpu_time_seconds.labels(gpu_uuid=gpu_uuid, process_name=proc, username=user).inc(val)
 
-def _parse_label_key(key: str) -> tuple[str, str, str]:
-    """Parse a label key into (gpu_uuid, process_name, username).
-    Handles both new format 'uuid|name|user' and legacy format 'uuid|name'."""
+def _parse_label_key(key: str) -> Tuple[str, str, str]:
     parts = key.split("|", 2)
-    if len(parts) == 3:
-        return parts[0], parts[1], parts[2]
-    return parts[0], parts[1], "unknown"
+    return (parts[0], parts[1], parts[2]) if len(parts) == 3 else (parts[0], parts[1], "unknown")
 
-
-def _restore_counters(saved_totals: dict[str, dict[str, float]]) -> None:
-    """Replay saved counter totals into Prometheus by calling inc()."""
-    for key, val in saved_totals.get("completed", {}).items():
-        if val > 0:
-            gpu_uuid, process_name, username = _parse_label_key(key)
-            gpu_job_completed.labels(gpu_uuid=gpu_uuid, process_name=process_name, username=username).inc(val)
-    for key, val in saved_totals.get("cpu_time", {}).items():
-        if val > 0:
-            gpu_uuid, process_name, username = _parse_label_key(key)
-            gpu_job_cpu_time_seconds.labels(gpu_uuid=gpu_uuid, process_name=process_name, username=username).inc(val)
-    for key, val in saved_totals.get("gpu_time", {}).items():
-        if val > 0:
-            gpu_uuid, process_name, username = _parse_label_key(key)
-            gpu_job_gpu_time_seconds.labels(gpu_uuid=gpu_uuid, process_name=process_name, username=username).inc(val)
-
+# --- NVML & Process Helpers (Existing logic optimized for 3.6) ---
 
 def _nvml_init() -> None:
-    """
-    Initialise NVML, populate handle cache, and determine per-GPU tracking mode.
-
-    For each GPU, accounting mode is attempted first (requires root).
-    If activation fails, the current mode is read back; if it was already
-    enabled by the user, accounting mode is still used.  Otherwise the GPU
-    falls back to polling-based GPU time estimation.
-    """
     global _NVML_AVAILABLE
-    if not _NVML_AVAILABLE:
-        logger.warning("pynvml not installed — GPU time tracking disabled.")
-        return
+    if not _NVML_AVAILABLE: return
     try:
         pynvml.nvmlInit()
-        driver = pynvml.nvmlSystemGetDriverVersion()
-        logger.info("NVML initialised (driver %s).", driver)
-    except pynvml.NVMLError as exc:
-        logger.warning("NVML init failed (%s) — GPU time tracking disabled.", exc)
+        logger.info(f"NVML initialised (driver {pynvml.nvmlSystemGetDriverVersion()}).")
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            u = pynvml.nvmlDeviceGetUUID(h)
+            u = u.decode() if isinstance(u, bytes) else u
+            _nvml_handle_cache[u] = h
+            try:
+                pynvml.nvmlDeviceSetAccountingMode(h, pynvml.NVML_FEATURE_ENABLED)
+                _accounting_enabled[u] = True
+            except:
+                try: _accounting_enabled[u] = (pynvml.nvmlDeviceGetAccountingMode(h) == pynvml.NVML_FEATURE_ENABLED)
+                except: _accounting_enabled[u] = False
+    except Exception as e:
+        logger.warning(f"NVML init failed: {e}")
         _NVML_AVAILABLE = False
-        return
 
-    count = pynvml.nvmlDeviceGetCount()
-    for i in range(count):
-        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-        uuid = pynvml.nvmlDeviceGetUUID(handle)
-        _nvml_handle_cache[uuid] = handle
+def _get_nvml_handle(gpu_uuid: str):
+    return _nvml_handle_cache.get(gpu_uuid)
 
-        # Try to enable accounting mode.
-        try:
-            pynvml.nvmlDeviceSetAccountingMode(handle, pynvml.NVML_FEATURE_ENABLED)
-            _accounting_enabled[uuid] = True
-            logger.info("GPU %s — accounting mode: ENABLED (activated now).", uuid)
-            continue
-        except pynvml.NVMLError:
-            pass  # may already be on, or no permission — check below
+def _read_gpu_time_accounting(handle, pid):
+    try: return pynvml.nvmlDeviceGetAccountingStats(handle, pid).time / 1000.0
+    except: return 0.0
 
-        # Activation failed: read the current state.
-        try:
-            mode = pynvml.nvmlDeviceGetAccountingMode(handle)
-            _accounting_enabled[uuid] = (mode == pynvml.NVML_FEATURE_ENABLED)
-        except pynvml.NVMLError:
-            _accounting_enabled[uuid] = False
-
-        if _accounting_enabled[uuid]:
-            logger.info("GPU %s — accounting mode: ENABLED (was already on).", uuid)
-        else:
-            logger.warning(
-                "GPU %s — accounting mode: UNAVAILABLE — falling back to polling.", uuid
-            )
-
-
-def _get_nvml_handle(gpu_uuid: str) -> object | None:
-    """Return a cached pynvml device handle for *gpu_uuid*, or None on error."""
-    if not _NVML_AVAILABLE:
-        return None
-    if gpu_uuid in _nvml_handle_cache:
-        return _nvml_handle_cache[gpu_uuid]
-    try:
-        handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode())
-        _nvml_handle_cache[gpu_uuid] = handle
-        return handle
-    except pynvml.NVMLError as exc:
-        logger.warning("Cannot get NVML handle for %s: %s", gpu_uuid, exc)
-        _nvml_handle_cache[gpu_uuid] = None
-        return None
-
-
-# ---------------------------------------------------------------------------
-# GPU time helpers
-# ---------------------------------------------------------------------------
-
-def _read_gpu_time_accounting(handle: object | None, pid: int) -> float:
-    """
-    Return GPU active time in seconds for *pid* via NVML accounting stats.
-    Works for both running and completed processes.
-    Returns 0.0 if unavailable.
-    """
-    if handle is None:
-        return 0.0
-    try:
-        stats = pynvml.nvmlDeviceGetAccountingStats(handle, pid)
-        return stats.time / 1000.0  # ms → s
-    except pynvml.NVMLError as exc:
-        logger.debug("Accounting stats unavailable for PID %d: %s", pid, exc)
-        return 0.0
-
-
-def _sample_gpu_active_seconds(
-    handle: object | None,
-    pid: int,
-    last_util_ts: int,
-) -> tuple[float, int]:
-    """
-    Fetch SM utilisation samples for *pid* that arrived after *last_util_ts*
-    (microseconds since epoch) and compute the weighted active seconds.
-
-    Returns (gpu_active_seconds_delta, updated_last_util_ts).
-    """
-    if handle is None:
-        return 0.0, last_util_ts
+def _sample_gpu_active_seconds(handle, pid, last_util_ts):
     try:
         samples = pynvml.nvmlDeviceGetProcessUtilizationSample(handle, last_util_ts)
-    except pynvml.NVMLError:
-        return 0.0, last_util_ts
+        pid_samples = sorted((s for s in samples if s.pid == pid), key=lambda s: s.timeStamp)
+        gpu_active, prev_ts = 0.0, last_util_ts
+        for s in pid_samples:
+            interval = (s.timeStamp - prev_ts) / 1e6
+            if interval > 0: gpu_active += (s.smUtil / 100.0) * interval
+            prev_ts = s.timeStamp
+        return gpu_active, prev_ts
+    except: return 0.0, last_util_ts
 
-    pid_samples = sorted(
-        (s for s in samples if s.pid == pid),
-        key=lambda s: s.timeStamp,
-    )
-    if not pid_samples:
-        return 0.0, last_util_ts
-
-    gpu_active = 0.0
-    prev_ts = last_util_ts
-    for s in pid_samples:
-        interval_s = (s.timeStamp - prev_ts) / 1e6  # µs → s
-        if interval_s > 0:
-            gpu_active += (s.smUtil / 100.0) * interval_s
-        prev_ts = s.timeStamp
-
-    return gpu_active, prev_ts
-
-
-# ---------------------------------------------------------------------------
-# State per tracked PID
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ProcessEntry:
-    gpu_uuid: str
-    process_name: str
-    username: str
-    # CPU time
-    baseline_cpu: float        # cpu_times snapshot when PID was first seen
-    last_cpu: float            # most recent cpu_times snapshot
-    # GPU time — polling mode only (ignored when accounting mode is active)
-    accumulated_gpu_s: float = 0.0
-    last_util_ts: int = 0      # µs since epoch; set to now on first arrival
-
-
-def _read_cpu_time(pid: int) -> float | None:
-    """Return user+system CPU seconds for *pid*, or None if unavailable."""
+def _read_cpu_time(pid):
     try:
-        p = psutil.Process(pid)
-        t = p.cpu_times()
+        t = psutil.Process(pid).cpu_times()
         return t.user + t.system
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return None
+    except: return None
 
-
-def _get_username(pid: int) -> str:
-    """Return the username of the process owner for *pid*, or 'unknown'."""
+def _get_username(pid):
     try:
-        return psutil.Process(pid).username()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return "unknown"
+        u = psutil.Process(pid).username()
+        return u() if callable(u) else u
+    except: return "unknown"
 
-
-# ---------------------------------------------------------------------------
-# Core loop helpers
-# ---------------------------------------------------------------------------
-
-def query_gpu_processes() -> dict[int, tuple[str, str]] | None:
-    """
-    Run nvidia-smi and return {pid: (gpu_uuid, process_name)}.
-    Returns None on any nvidia-smi failure so the caller can skip the cycle.
-    """
+def query_gpu_processes():
     try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=gpu_uuid,pid,name",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except FileNotFoundError:
-        logger.error("nvidia-smi not found — is the NVIDIA driver installed?")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error("nvidia-smi timed out.")
-        return None
-    except OSError as exc:
-        logger.error("Failed to run nvidia-smi: %s", exc)
-        return None
+        res = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,name", "--format=csv,noheader,nounits"], 
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
+        if res.returncode != 0: return None
+        procs = {}
+        for line in res.stdout.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 3: procs[int(parts[1])] = (parts[0], parts[2])
+        return procs
+    except: return None
 
-    if result.returncode != 0:
-        logger.error(
-            "nvidia-smi exited with code %d: %s",
-            result.returncode,
-            result.stderr.strip(),
-        )
-        return None
+# --- Main Loop Logic ---
 
-    processes: dict[int, tuple[str, str]] = {}
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 3:
-            logger.warning("Unexpected nvidia-smi output line: %r", line)
-            continue
-        gpu_uuid, pid_str, process_name = parts
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            logger.warning("Non-integer PID in nvidia-smi output: %r", pid_str)
-            continue
-        processes[pid] = (gpu_uuid, process_name)
-
-    return processes
-
-
-def update_tracked(
-    tracked: dict[int, ProcessEntry],
-    current_pids: dict[int, tuple[str, str]],
-) -> None:
-    """
-    For each PID currently visible on GPU:
-    - Register new arrivals (record baseline CPU time, increment running gauge).
-    - Refresh last_cpu for existing entries.
-    - For polling-mode GPUs, accumulate GPU active time.
-    - Update running job gauges (cpu/gpu time so far).
-    """
+def update_tracked(tracked: Dict[int, ProcessEntry], current_pids: Dict[int, Tuple[str, str]]) -> None:
     now_us = int(time.time() * 1e6)
-
     for pid, (gpu_uuid, process_name) in current_pids.items():
         if pid not in tracked:
             baseline = _read_cpu_time(pid) or 0.0
             username = _get_username(pid)
-            tracked[pid] = ProcessEntry(
-                gpu_uuid=gpu_uuid,
-                process_name=process_name,
-                username=username,
-                baseline_cpu=baseline,
-                last_cpu=baseline,
-                accumulated_gpu_s=0.0,
-                last_util_ts=now_us,
-            )
+            tracked[pid] = ProcessEntry(gpu_uuid, process_name, username, baseline, baseline, 0.0, now_us)
             gpu_job_running.labels(gpu_uuid=gpu_uuid, process_name=process_name, username=username).inc()
-            logger.info(
-                "[%s] [Started ] PID: %d (%s) | GPU: %s | User: %s",
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                pid,
-                process_name,
-                gpu_uuid,
-                username,
-            )
+            logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Started ] PID: {pid} ({process_name}) | GPU: {gpu_uuid} | User: {username}")
         else:
             entry = tracked[pid]
-
-            # Refresh CPU snapshot.
             fresh_cpu = _read_cpu_time(pid)
-            if fresh_cpu is not None:
-                entry.last_cpu = fresh_cpu
-
-            # Polling mode: accumulate GPU utilisation.
+            if fresh_cpu is not None: entry.last_cpu = fresh_cpu
             if not _accounting_enabled.get(gpu_uuid, False):
-                handle = _get_nvml_handle(gpu_uuid)
-                gpu_delta, new_ts = _sample_gpu_active_seconds(
-                    handle, pid, entry.last_util_ts
-                )
-                entry.accumulated_gpu_s += gpu_delta
+                delta, new_ts = _sample_gpu_active_seconds(_get_nvml_handle(gpu_uuid), pid, entry.last_util_ts)
+                entry.accumulated_gpu_s += delta
                 entry.last_util_ts = new_ts
 
-        # Update live gauges for this PID.
         entry = tracked[pid]
-        pid_str = str(pid)
-        cpu_elapsed = max(0.0, entry.last_cpu - entry.baseline_cpu)
+        cpu_val = max(0.0, entry.last_cpu - entry.baseline_cpu)
+        gpu_val = _read_gpu_time_accounting(_get_nvml_handle(gpu_uuid), pid) if _accounting_enabled.get(gpu_uuid, False) else entry.accumulated_gpu_s
+        lbls = {"gpu_uuid": gpu_uuid, "process_name": process_name, "username": entry.username}
+        gpu_job_running_cpu_time_seconds.labels(**lbls, pid=str(pid)).set(cpu_val)
+        gpu_job_running_gpu_time_seconds.labels(**lbls, pid=str(pid)).set(gpu_val)
 
-        if _accounting_enabled.get(gpu_uuid, False):
-            handle = _get_nvml_handle(gpu_uuid)
-            gpu_elapsed = _read_gpu_time_accounting(handle, pid)
-        else:
-            gpu_elapsed = entry.accumulated_gpu_s
-
-        gpu_job_running_cpu_time_seconds.labels(
-            gpu_uuid=gpu_uuid, process_name=process_name, username=entry.username, pid=pid_str
-        ).set(cpu_elapsed)
-        gpu_job_running_gpu_time_seconds.labels(
-            gpu_uuid=gpu_uuid, process_name=process_name, username=entry.username, pid=pid_str
-        ).set(gpu_elapsed)
-
-
-def process_finished(
-    tracked: dict[int, ProcessEntry],
-    current_pids: dict[int, tuple[str, str]],
-) -> None:
-    """
-    Detect PIDs that disappeared, record completed metrics, clean up running
-    gauges, log, then remove from tracked.
-    """
-    finished_pids = set(tracked) - set(current_pids)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for pid in finished_pids:
+def process_finished(tracked: Dict[int, ProcessEntry], current_pids: Dict[int, Tuple[str, str]]) -> None:
+    for pid in (set(tracked) - set(current_pids)):
         entry = tracked.pop(pid)
-        pid_str = str(pid)
-
-        # --- CPU time ---
-        final_cpu = _read_cpu_time(pid)
-        if final_cpu is None:
-            final_cpu = entry.last_cpu
-        cpu_used = max(0.0, final_cpu - entry.baseline_cpu)
-
-        # --- GPU time ---
+        cpu_used = max(0.0, (_read_cpu_time(pid) or entry.last_cpu) - entry.baseline_cpu)
+        
         handle = _get_nvml_handle(entry.gpu_uuid)
         if _accounting_enabled.get(entry.gpu_uuid, False):
-            gpu_used = _read_gpu_time_accounting(handle, pid)
-            gpu_mode_tag = "accounting"
+            gpu_used, mode = _read_gpu_time_accounting(handle, pid), "accounting"
         else:
-            gpu_delta, _ = _sample_gpu_active_seconds(handle, pid, entry.last_util_ts)
-            gpu_used = entry.accumulated_gpu_s + gpu_delta
-            if gpu_used == 0.0:
-                # No utilisation samples captured (job too short) — assume 100% GPU usage.
-                now_us = int(time.time() * 1e6)
-                gpu_used = (now_us - entry.last_util_ts) / 1e6
-            gpu_mode_tag = "polling"
+            delta, _ = _sample_gpu_active_seconds(handle, pid, entry.last_util_ts)
+            gpu_used, mode = entry.accumulated_gpu_s + delta, "polling"
+            if gpu_used == 0.0: gpu_used = (int(time.time() * 1e6) - entry.last_util_ts) / 1e6
 
-        # Record completed-job metrics.
-        labels = {"gpu_uuid": entry.gpu_uuid, "process_name": entry.process_name, "username": entry.username}
-        gpu_job_completed.labels(**labels).inc()
-        gpu_job_cpu_time_seconds.labels(**labels).inc(cpu_used)
-        gpu_job_gpu_time_seconds.labels(**labels).inc(gpu_used)
-        gpu_job_cpu_duration.labels(**labels).observe(cpu_used)
-        gpu_job_gpu_duration.labels(**labels).observe(gpu_used)
+        # 로그 기록
+        _log_finished_job(entry, cpu_used, gpu_used, mode)
 
-        # Keep internal totals in sync for state persistence.
+        # Prometheus & internal totals 업데이트
+        lbls = {"gpu_uuid": entry.gpu_uuid, "process_name": entry.process_name, "username": entry.username}
+        gpu_job_completed.labels(**lbls).inc()
+        gpu_job_cpu_time_seconds.labels(**lbls).inc(cpu_used)
+        gpu_job_gpu_time_seconds.labels(**lbls).inc(gpu_used)
+        gpu_job_cpu_duration.labels(**lbls).observe(cpu_used)
+        gpu_job_gpu_duration.labels(**lbls).observe(gpu_used)
+
         key = _label_key(entry.gpu_uuid, entry.process_name, entry.username)
         _totals["completed"][key] = _totals["completed"].get(key, 0) + 1
-        _totals["cpu_time"][key]   = _totals["cpu_time"].get(key, 0)  + cpu_used
-        _totals["gpu_time"][key]   = _totals["gpu_time"].get(key, 0)  + gpu_used
+        _totals["cpu_time"][key] = _totals["cpu_time"].get(key, 0) + cpu_used
+        _totals["gpu_time"][key] = _totals["gpu_time"].get(key, 0) + gpu_used
 
-        # Clean up running-job gauges.
-        gpu_job_running.labels(**labels).dec()
-        gpu_job_running_cpu_time_seconds.remove(entry.gpu_uuid, entry.process_name, entry.username, pid_str)
-        gpu_job_running_gpu_time_seconds.remove(entry.gpu_uuid, entry.process_name, entry.username, pid_str)
+        gpu_job_running.labels(**lbls).dec()
+        gpu_job_running_cpu_time_seconds.remove(**lbls, pid=str(pid))
+        gpu_job_running_gpu_time_seconds.remove(**lbls, pid=str(pid))
+        logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Finished] PID: {pid} ({entry.process_name}) | CPU: {cpu_used:.2f}s | GPU: {gpu_used:.2f}s")
 
-        logger.info(
-            "[%s] [Finished] PID: %d (%s) | GPU: %s | "
-            "CPU time: %.2fs | GPU active: %.2fs [%s]",
-            ts,
-            pid,
-            entry.process_name,
-            entry.gpu_uuid,
-            cpu_used,
-            gpu_used,
-            gpu_mode_tag,
-        )
-
-
-def main() -> None:
+def main():
     global _totals
-
     _nvml_init()
-
-    # ------------------------------------------------------------------
-    # Restore persisted state (counters + tracked PIDs)
-    # ------------------------------------------------------------------
-    saved_totals, saved_tracked = _load_state()
-
-    # Carry over accumulated totals so future increments stay cumulative.
-    _totals = saved_totals
-
-    # Replay saved counter values into Prometheus before exposing metrics.
-    _restore_counters(saved_totals)
-
+    
+    # 1. 과거 로그로부터 통계 복구
+    _totals = _recalculate_totals_from_logs()
+    _restore_prometheus_counters()
+    
+    # 2. 실행 중이었던 작업 복구
+    tracked = _load_tracked_state()
+    for e in tracked.values():
+        gpu_job_running.labels(gpu_uuid=e.gpu_uuid, process_name=e.process_name, username=e.username).inc()
+    
     start_http_server(EXPORTER_PORT)
-    logger.info(
-        "GPU Job Exporter started — metrics at http://0.0.0.0:%d/metrics",
-        EXPORTER_PORT,
-    )
+    logger.info(f"Exporter started on port {EXPORTER_PORT} (Logs: {LOG_DIR})")
 
-    tracked: dict[int, ProcessEntry] = {}
-
-    if saved_tracked:
-        # Pre-populate tracked dict and running gauge so that the first poll
-        # cycle can correctly decrement them for PIDs that finished while the
-        # daemon was down.
-        for pid, entry in saved_tracked.items():
-            tracked[pid] = entry
-            gpu_job_running.labels(
-                gpu_uuid=entry.gpu_uuid, process_name=entry.process_name, username=entry.username
-            ).inc()
-            # Restore live CPU/GPU time gauges immediately so Prometheus sees
-            # non-zero values even before the first poll completes.
-            cpu_elapsed = max(0.0, entry.last_cpu - entry.baseline_cpu)
-            pid_str = str(pid)
-            gpu_job_running_cpu_time_seconds.labels(
-                gpu_uuid=entry.gpu_uuid,
-                process_name=entry.process_name,
-                username=entry.username,
-                pid=pid_str,
-            ).set(cpu_elapsed)
-            gpu_job_running_gpu_time_seconds.labels(
-                gpu_uuid=entry.gpu_uuid,
-                process_name=entry.process_name,
-                username=entry.username,
-                pid=pid_str,
-            ).set(entry.accumulated_gpu_s)
-        logger.info("Restored %d tracked PID(s) from state file.", len(tracked))
-
-    # first_cycle=False when restored so that process_finished runs on the very
-    # first poll and can immediately record PIDs that ended while we were down.
-    first_cycle = len(tracked) == 0
-
-    # ------------------------------------------------------------------
-    # Signal handlers — save state on clean shutdown
-    # ------------------------------------------------------------------
-    def _on_exit(signum, frame):
-        logger.info("Signal %d received — saving state before exit.", signum)
+    def _on_exit(s, f):
         _save_state(tracked)
         raise SystemExit(0)
-
     signal.signal(signal.SIGTERM, _on_exit)
     signal.signal(signal.SIGINT, _on_exit)
 
-    # ------------------------------------------------------------------
-    # Main poll loop
-    # ------------------------------------------------------------------
-    save_cycle = 0
-
+    first_cycle, save_cycle = True, 0
     while True:
-        current_pids = query_gpu_processes()
-
-        if current_pids is None:
-            time.sleep(POLL_INTERVAL)
-            continue
-
-        if not first_cycle:
-            process_finished(tracked, current_pids)
-
-        update_tracked(tracked, current_pids)
-        first_cycle = False
-
-        # Periodic state persistence
-        save_cycle += 1
-        if save_cycle >= _SAVE_EVERY:
-            _save_state(tracked)
-            save_cycle = 0
-
+        pids = query_gpu_processes()
+        if pids is not None:
+            if not first_cycle: process_finished(tracked, pids)
+            update_tracked(tracked, pids)
+            first_cycle = False
+            save_cycle += 1
+            if save_cycle >= _SAVE_EVERY:
+                _save_state(tracked)
+                save_cycle = 0
         time.sleep(POLL_INTERVAL)
-
 
 if __name__ == "__main__":
     main()

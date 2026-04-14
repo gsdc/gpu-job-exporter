@@ -23,12 +23,12 @@ cp "${NAME}.service"    "${SRCDIR}/"
 
 # ── 3. Vendor Python dependencies into lib/ ───────────────────────────────────
 echo ">>> Installing Python deps into ${SRCDIR}/lib/ ..."
+# Use requirements.txt to ensure consistency and Python 3.4 compatibility
 pip3 install \
     --target="${SRCDIR}/lib" \
     --quiet \
     --no-compile \
-    "prometheus_client>=0.20.0" \
-    "psutil>=5.9.0"
+    -r requirements.txt
 
 # Strip __pycache__ and test directories to keep the RPM lean
 find "${SRCDIR}/lib" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
