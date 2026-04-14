@@ -64,9 +64,10 @@ _accounting_enabled: Dict[str, bool] = {}
 _totals: Dict[str, Dict[str, float]] = {"completed": {}, "cpu_time": {}, "gpu_time": {}}
 
 class ProcessEntry:
-    def __init__(self, gpu_uuid: str, process_name: str, username: str, 
-                 baseline_cpu: float, last_cpu: float, 
-                 accumulated_gpu_s: float = 0.0, last_util_ts: int = 0):
+    def __init__(self, gpu_uuid: str, process_name: str, username: str,
+                 baseline_cpu: float, last_cpu: float,
+                 accumulated_gpu_s: float = 0.0, last_util_ts: int = 0,
+                 start_time: float = 0.0):
         self.gpu_uuid = gpu_uuid
         self.process_name = process_name
         self.username = username
@@ -74,6 +75,7 @@ class ProcessEntry:
         self.last_cpu = last_cpu
         self.accumulated_gpu_s = accumulated_gpu_s
         self.last_util_ts = last_util_ts
+        self.start_time = start_time if start_time > 0.0 else time.time()
 
 def _label_key(gpu_uuid: str, process_name: str, username: str) -> str:
     return f"{gpu_uuid}|{process_name}|{username}"
@@ -135,6 +137,7 @@ def _save_state(tracked: Dict[int, ProcessEntry]) -> None:
                 "gpu_uuid": e.gpu_uuid, "process_name": e.process_name, "username": e.username,
                 "baseline_cpu": e.baseline_cpu, "last_cpu": e.last_cpu,
                 "accumulated_gpu_s": e.accumulated_gpu_s, "last_util_ts": e.last_util_ts,
+                "start_time": e.start_time,
             } for pid, e in tracked.items()
         },
     }
@@ -160,6 +163,7 @@ def _load_tracked_state() -> Dict[int, ProcessEntry]:
                 gpu_uuid=e["gpu_uuid"], process_name=e["process_name"], username=e.get("username", "unknown"),
                 baseline_cpu=e["baseline_cpu"], last_cpu=e["last_cpu"],
                 accumulated_gpu_s=e["accumulated_gpu_s"], last_util_ts=e["last_util_ts"],
+                start_time=e.get("start_time", 0.0),
             )
         return tracked
     except Exception:
@@ -200,9 +204,23 @@ def _nvml_init() -> None:
             try:
                 pynvml.nvmlDeviceSetAccountingMode(h, pynvml.NVML_FEATURE_ENABLED)
                 _accounting_enabled[u] = True
-            except:
-                try: _accounting_enabled[u] = (pynvml.nvmlDeviceGetAccountingMode(h) == pynvml.NVML_FEATURE_ENABLED)
-                except: _accounting_enabled[u] = False
+                logger.info(f"GPU[{i}] {u}: accounting mode ENABLED (set successfully)")
+            except Exception as set_err:
+                try:
+                    mode = pynvml.nvmlDeviceGetAccountingMode(h)
+                    enabled = (mode == pynvml.NVML_FEATURE_ENABLED)
+                    _accounting_enabled[u] = enabled
+                    logger.warning(
+                        f"GPU[{i}] {u}: accounting mode set FAILED ({set_err}), "
+                        f"current state: {'ENABLED' if enabled else 'DISABLED'} — "
+                        f"{'using accounting for final values' if enabled else 'falling back to utilization sampling'}"
+                    )
+                except Exception as get_err:
+                    _accounting_enabled[u] = False
+                    logger.warning(
+                        f"GPU[{i}] {u}: accounting mode UNKNOWN (set failed: {set_err}, get failed: {get_err}) — "
+                        f"falling back to utilization sampling"
+                    )
     except Exception as e:
         logger.warning(f"NVML init failed: {e}")
         _NVML_AVAILABLE = False
@@ -265,14 +283,21 @@ def update_tracked(tracked: Dict[int, ProcessEntry], current_pids: Dict[int, Tup
             entry = tracked[pid]
             fresh_cpu = _read_cpu_time(pid)
             if fresh_cpu is not None: entry.last_cpu = fresh_cpu
-            if not _accounting_enabled.get(gpu_uuid, False):
-                delta, new_ts = _sample_gpu_active_seconds(_get_nvml_handle(gpu_uuid), pid, entry.last_util_ts)
+            # accounting mode 여부와 관계없이 항상 sampling 누적
+            # (nvmlDeviceGetAccountingStats는 실행 중인 프로세스에서 0을 반환할 수 있음)
+            delta, new_ts = _sample_gpu_active_seconds(_get_nvml_handle(gpu_uuid), pid, entry.last_util_ts)
+            if delta > 0 or new_ts != entry.last_util_ts:
                 entry.accumulated_gpu_s += delta
                 entry.last_util_ts = new_ts
+                if _accounting_enabled.get(gpu_uuid, False):
+                    logger.debug(
+                        f"PID {pid} GPU sample: +{delta:.3f}s (total_sampled={entry.accumulated_gpu_s:.3f}s)"
+                    )
 
         entry = tracked[pid]
         cpu_val = max(0.0, entry.last_cpu - entry.baseline_cpu)
-        gpu_val = _read_gpu_time_accounting(_get_nvml_handle(gpu_uuid), pid) if _accounting_enabled.get(gpu_uuid, False) else entry.accumulated_gpu_s
+        # 실시간 게이지는 sampling 누적값 사용 (accounting은 완료 시에만 신뢰)
+        gpu_val = entry.accumulated_gpu_s
         lbls = {"gpu_uuid": gpu_uuid, "process_name": process_name, "username": entry.username}
         gpu_job_running_cpu_time_seconds.labels(**lbls, pid=str(pid)).set(cpu_val)
         gpu_job_running_gpu_time_seconds.labels(**lbls, pid=str(pid)).set(gpu_val)
@@ -283,12 +308,41 @@ def process_finished(tracked: Dict[int, ProcessEntry], current_pids: Dict[int, T
         cpu_used = max(0.0, (_read_cpu_time(pid) or entry.last_cpu) - entry.baseline_cpu)
         
         handle = _get_nvml_handle(entry.gpu_uuid)
+        pid_lifetime = time.time() - entry.start_time
         if _accounting_enabled.get(entry.gpu_uuid, False):
-            gpu_used, mode = _read_gpu_time_accounting(handle, pid), "accounting"
+            acct_val = _read_gpu_time_accounting(handle, pid)
+            if acct_val > 0:
+                gpu_used, mode = acct_val, "accounting"
+                logger.info(
+                    f"PID {pid}: accounting gpu_time={acct_val:.3f}s "
+                    f"(sampled={entry.accumulated_gpu_s:.3f}s, lifetime={pid_lifetime:.3f}s)"
+                )
+            else:
+                # accounting=0 → sampling 누적값 우선, 그것도 0이면 PID 생존 시간으로 폴백
+                delta, _ = _sample_gpu_active_seconds(handle, pid, entry.last_util_ts)
+                sampled = entry.accumulated_gpu_s + delta
+                if sampled > 0:
+                    gpu_used, mode = sampled, "accounting(0)-fallback-sampling"
+                    logger.warning(
+                        f"PID {pid}: accounting returned 0, using sampled={gpu_used:.3f}s "
+                        f"(lifetime={pid_lifetime:.3f}s)"
+                    )
+                else:
+                    gpu_used, mode = pid_lifetime, "accounting(0)-fallback-lifetime"
+                    logger.warning(
+                        f"PID {pid}: accounting=0 and sampling=0, "
+                        f"using pid lifetime={gpu_used:.3f}s as gpu_time estimate"
+                    )
         else:
             delta, _ = _sample_gpu_active_seconds(handle, pid, entry.last_util_ts)
-            gpu_used, mode = entry.accumulated_gpu_s + delta, "polling"
-            if gpu_used == 0.0: gpu_used = (int(time.time() * 1e6) - entry.last_util_ts) / 1e6
+            sampled = entry.accumulated_gpu_s + delta
+            if sampled > 0:
+                gpu_used, mode = sampled, "sampling"
+            else:
+                gpu_used, mode = pid_lifetime, "sampling(0)-fallback-lifetime"
+                logger.warning(
+                    f"PID {pid}: sampling=0, using pid lifetime={gpu_used:.3f}s as gpu_time estimate"
+                )
 
         # 로그 기록
         _log_finished_job(entry, cpu_used, gpu_used, mode)
@@ -307,8 +361,8 @@ def process_finished(tracked: Dict[int, ProcessEntry], current_pids: Dict[int, T
         _totals["gpu_time"][key] = _totals["gpu_time"].get(key, 0) + gpu_used
 
         gpu_job_running.labels(**lbls).dec()
-        gpu_job_running_cpu_time_seconds.remove(**lbls, pid=str(pid))
-        gpu_job_running_gpu_time_seconds.remove(**lbls, pid=str(pid))
+        gpu_job_running_cpu_time_seconds.remove(entry.gpu_uuid, entry.process_name, entry.username, str(pid))
+        gpu_job_running_gpu_time_seconds.remove(entry.gpu_uuid, entry.process_name, entry.username, str(pid))
         logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Finished] PID: {pid} ({entry.process_name}) | CPU: {cpu_used:.2f}s | GPU: {gpu_used:.2f}s")
 
 def main():
