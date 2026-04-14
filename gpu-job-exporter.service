@@ -21,7 +21,6 @@ PrivateTmp=true
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=gpu-job-exporter
-ReadWritePaths=/var/lib/gpu_job_exporter
-
+ReadWritePaths=/var/log/gpu_job_exporter /var/lib/gpu_job_exporter
 [Install]
 WantedBy=multi-user.target

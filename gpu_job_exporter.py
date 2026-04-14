@@ -80,14 +80,15 @@ class ProcessEntry:
 def _label_key(gpu_uuid: str, process_name: str, username: str) -> str:
     return f"{gpu_uuid}|{process_name}|{username}"
 
-def _log_finished_job(entry: ProcessEntry, cpu_used: float, gpu_used: float, mode: str) -> None:
+def _log_finished_job(entry: ProcessEntry, pid: int, cpu_used: float, gpu_used: float, mode: str) -> None:
     """작업 종료 시 JSON 로그 파일에 기록 (JSON Lines 포맷)"""
     os.makedirs(LOG_DIR, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     log_file = os.path.join(LOG_DIR, f"jobs-{today}.json")
-    
+
     record = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pid": pid,
         "gpu_uuid": entry.gpu_uuid,
         "process_name": entry.process_name,
         "username": entry.username,
@@ -345,7 +346,7 @@ def process_finished(tracked: Dict[int, ProcessEntry], current_pids: Dict[int, T
                 )
 
         # 로그 기록
-        _log_finished_job(entry, cpu_used, gpu_used, mode)
+        _log_finished_job(entry, pid, cpu_used, gpu_used, mode)
 
         # Prometheus & internal totals 업데이트
         lbls = {"gpu_uuid": entry.gpu_uuid, "process_name": entry.process_name, "username": entry.username}
