@@ -41,7 +41,11 @@ jobs:
         if: matrix.el == '9'
         run: dnf install -y git
 
-      - name: Checkout
+      - name: Checkout (EL7)
+        if: matrix.el == '7'
+        uses: actions/checkout@v2
+      - name: Checkout (EL9)
+        if: matrix.el == '9'
         uses: actions/checkout@v4
 
       - name: Extract version from tag
