@@ -96,8 +96,7 @@ exit 0
 # ── Files ────────────────────────────────────────────────────────────────────
 %files
 %{_bindir}/%{name}
-%{_libexecdir}/%{name}/gpu_job_exporter.py
-%{_libexecdir}/%{name}/lib/
+%{_libexecdir}/%{name}/
 %{_unitdir}/%{name}.service
 %dir %attr(0755, gpu-exporter, gpu-exporter) %{_sharedstatedir}/%{name}
 %dir %attr(0755, gpu-exporter, gpu-exporter) %{_localstatedir}/log/%{name}
