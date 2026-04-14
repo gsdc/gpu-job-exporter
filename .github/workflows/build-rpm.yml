@@ -16,44 +16,12 @@ jobs:
             image: "centos:7"
           - el: "9"
             image: "almalinux:9"
-    container:
-      image: ${{ matrix.image }}
+    # container: 제거 — Node.js 20 기반 액션(checkout, upload-artifact)은
+    # CentOS 7의 GLIBC 2.17과 호환되지 않으므로 호스트에서 실행한다.
+    # 빌드만 docker run으로 컨테이너 안에서 수행한다.
 
     steps:
-      # CentOS 7은 2024-06 EOL → 미러가 비활성화되어 vault로 교체 필요
-      - name: Fix CentOS 7 EOL repos
-        if: matrix.el == '7'
-        run: |
-          sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo
-          sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \
-              /etc/yum.repos.d/CentOS-*.repo
-          yum install -y epel-release
-          # EPEL 7도 아카이브로 교체
-          sed -i 's|^mirrorlist=|#mirrorlist=|g'  /etc/yum.repos.d/epel*.repo
-          sed -i 's|^#baseurl=http://download.fedoraproject.org/pub/epel|baseurl=https://archives.fedoraproject.org/pub/archive/epel|g' \
-              /etc/yum.repos.d/epel*.repo
-
-      - name: Install git (EL7)
-        if: matrix.el == '7'
-        run: yum install -y git
-
-      - name: Install git (EL9)
-        if: matrix.el == '9'
-        run: dnf install -y git
-
-      - name: Checkout (EL7)
-        if: matrix.el == '7'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd "${GITHUB_WORKSPACE}"
-          git init .
-          git remote add origin \
-            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.ref }}"
-          git checkout FETCH_HEAD
-      - name: Checkout (EL9)
-        if: matrix.el == '9'
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Extract version from tag
@@ -64,16 +32,6 @@ jobs:
           echo "tag=${TAG}"     >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Tag: ${TAG}, Version: ${VERSION}"
-
-      - name: Install build dependencies (EL7)
-        if: matrix.el == '7'
-        run: |
-          yum install -y rpm-build python3 python3-pip python3-devel gcc systemd
-
-      - name: Install build dependencies (EL9)
-        if: matrix.el == '9'
-        run: |
-          dnf install -y rpm-build python3 python3-pip systemd-rpm-macros
 
       # EL7의 Python 3.6에서 작동하는 버전으로 의존성 제한
       #   prometheus_client >= 0.20.0 → Python 3.8+ 필요
@@ -103,23 +61,55 @@ jobs:
           grep "^Version:" gpu-job-exporter.spec
           grep "^VERSION=" build_rpm.sh
 
-      - name: Build RPM
-        run: bash build_rpm.sh
+      - name: Build RPM (EL7)
+        if: matrix.el == '7'
+        run: |
+          mkdir -p rpmbuild
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${GITHUB_WORKSPACE}/rpmbuild:/root/rpmbuild" \
+            -w /workspace \
+            centos:7 bash -c '
+              set -euo pipefail
+              sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/CentOS-*.repo
+              sed -i "s|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" \
+                  /etc/yum.repos.d/CentOS-*.repo
+              yum install -y epel-release
+              sed -i "s|^mirrorlist=|#mirrorlist=|g" /etc/yum.repos.d/epel*.repo
+              sed -i "s|^#baseurl=http://download.fedoraproject.org/pub/epel|baseurl=https://archives.fedoraproject.org/pub/archive/epel|g" \
+                  /etc/yum.repos.d/epel*.repo
+              yum install -y rpm-build python3 python3-pip python3-devel gcc systemd
+              bash build_rpm.sh
+            '
+
+      - name: Build RPM (EL9)
+        if: matrix.el == '9'
+        run: |
+          mkdir -p rpmbuild
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${GITHUB_WORKSPACE}/rpmbuild:/root/rpmbuild" \
+            -w /workspace \
+            almalinux:9 bash -c '
+              set -euo pipefail
+              dnf install -y rpm-build python3 python3-pip systemd-rpm-macros
+              bash build_rpm.sh
+            '
 
       - name: List built RPMs
-        run: find /root/rpmbuild/RPMS /root/rpmbuild/SRPMS -name "*.rpm" | sort
+        run: find rpmbuild/RPMS rpmbuild/SRPMS -name "*.rpm" | sort
 
       - name: Upload RPMs
         uses: actions/upload-artifact@v4
         with:
           name: rpms-el${{ matrix.el }}
-          path: /root/rpmbuild/RPMS/**/*.rpm
+          path: rpmbuild/RPMS/**/*.rpm
 
       - name: Upload SRPMs
         uses: actions/upload-artifact@v4
         with:
           name: srpms-el${{ matrix.el }}
-          path: /root/rpmbuild/SRPMS/**/*.rpm
+          path: rpmbuild/SRPMS/**/*.rpm
 
   release:
     needs: build-rpm
